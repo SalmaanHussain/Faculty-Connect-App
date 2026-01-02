@@ -11,101 +11,130 @@ using System.Threading.Tasks;
 using System.Diagnostics;
 using System.Collections.Generic;
 using System.Drawing;
-using Microsoft.Win32; // Add this for Registry access
+using Microsoft.Win32;
+using Firebase.Database;
+
 
 namespace FacultyConnectApp.Forms
 {
     public partial class MainDashboard : Form
     {
+        private List<ChatMessage> messageHistory = new List<ChatMessage>();
         private UserData currentUser;
         private string lecturerName;
         private FirebaseService firebaseService;
         private bool isConnected = false;
         private NotifyIcon notifyIcon;
         private List<VisitorRequest> visitorHistory = new List<VisitorRequest>();
-        private const int MAX_HISTORY = 5; // Keep last 5 visitors
+        private const int MAX_HISTORY = 5;
 
         public MainDashboard(UserData userData)
         {
             InitializeComponent();
             currentUser = userData;
 
- 
-
-            // Hide test buttons in production mode
             btnTestRequest.Visible = false;
             btnDirectTest.Visible = false;
             btnTestFirebase.Visible = false;
             btnRestartListener.Visible = false;
 
-            // Register resize event
             this.Resize += MainDashboard_Resize;
+
+            btnSendMessage.Click -= btnSendMessage_Click;
+            btnSendMessage.Click += btnSendMessage_Click;
         }
 
         private void MainDashboard_Resize(object sender, EventArgs e)
         {
-           
-        }
+            SetupMessagingLayout();
+            CenterControls();
 
+        }
         private void CenterControls()
-        {
-            int startY = 60; // Start position from top
-            int spacing = 30; // Spacing between labels
-
-            lblVisitorName.Top = startY;
-            lblStudentNumber.Top = startY + spacing;
-            lblPurpose.Top = startY + (spacing * 2);
-            lblTimestamp.Top = startY + (spacing * 3);
-
-            // Adjust label widths to match panel width
-            lblVisitorName.Width = panelVisitorMessage.Width - 40; // 20px margin on each side
-            lblStudentNumber.Width = panelVisitorMessage.Width - 40;
-            lblPurpose.Width = panelVisitorMessage.Width - 40;
-            lblTimestamp.Width = panelVisitorMessage.Width - 40;
-
-            // Center labels horizontally
-            lblVisitorName.Left = (panelVisitorMessage.Width - lblVisitorName.Width) / 2;
-            lblStudentNumber.Left = (panelVisitorMessage.Width - lblStudentNumber.Width) / 2;
-            lblPurpose.Left = (panelVisitorMessage.Width - lblPurpose.Width) / 2;
-            lblTimestamp.Left = (panelVisitorMessage.Width - lblTimestamp.Width) / 2;
-
-            // Show the visitor message title at the top center
-            lblVisitorMessage.Left = (panelVisitorMessage.Width - lblVisitorMessage.Width) / 2;
-            lblVisitorMessage.Top = 12;
-        }
-
-        private async void MainDashboard_Load(object sender, EventArgs e)
         {
             try
             {
-                // Set initial status
+
+                int leftMargin = 20;
+                int labelSpacing = 30;
+                int startY = 30;
+
+                lblVisitorName.Left = leftMargin;
+                lblVisitorName.Top = startY;
+                lblVisitorName.Width = panel3.Width - (leftMargin * 2);
+
+                lblStudentNumber.Left = leftMargin;
+                lblStudentNumber.Top = startY + labelSpacing;
+                lblStudentNumber.Width = panel3.Width - (leftMargin * 2);
+
+                lblPurpose.Left = leftMargin;
+                lblPurpose.Top = startY + (labelSpacing * 2);
+                lblPurpose.Width = panel3.Width - (leftMargin * 2);
+
+                lblTimestamp.Left = leftMargin;
+                lblTimestamp.Top = startY + (labelSpacing * 3);
+                lblTimestamp.Width = panel3.Width - (leftMargin * 2);
+
+                panelMessaging.Top = lblTimestamp.Bottom + 60;
+                panelMessaging.Left = leftMargin;
+                panelMessaging.Width = panel3.Width - (leftMargin * 2);
+
+                int remainingHeight = panel3.Height - panelMessaging.Top - 70; 
+                panelMessaging.Height = Math.Max(150, remainingHeight); 
+
+                int buttonY = panel3.Height - 60;
+                int buttonWidth = 200;
+
+                int totalWidth = panel3.Width;
+                int totalButtonWidth = buttonWidth * 3;
+                int totalSpacing = totalWidth - totalButtonWidth;
+                int buttonSpacing = totalSpacing / 4; 
+
+                btnAudioCall.Top = buttonY;
+                btnAudioCall.Left = buttonSpacing;
+                btnAudioCall.Width = buttonWidth;
+
+                btnVideoCall.Top = buttonY;
+                btnVideoCall.Left = buttonSpacing * 3 + buttonWidth * 2;
+                btnVideoCall.Width = buttonWidth;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error in CenterControls: {ex.Message}");
+            }
+        }
+
+
+        private async void MainDashboard_Load(object sender, EventArgs e)
+        {
+           
+            SetupMessagingLayout();
+
+            this.Resize += MainDashboard_Resize;
+            try
+            {
                 UpdateConnectionStatus("Initializing...");
                 Debug.WriteLine("MainDashboard is initializing...");
 
-                // Load lecturer identity from config
                 LoadLecturerIdentity();
 
-                // Initialize Firebase service
                 firebaseService = new FirebaseService(this);
                 firebaseService.SetNotifyIcon(notifyIcon);
 
                 if (!string.IsNullOrEmpty(lecturerName))
                 {
-                    // First test the connection
+
                     Debug.WriteLine("Testing Firebase connection...");
                     UpdateConnectionStatus($"Testing connection for {lecturerName}...");
                     await firebaseService.SilentTestConnection(lecturerName);
 
-                    // Then start listening for requests
                     Debug.WriteLine("Starting Firebase listener...");
                     UpdateConnectionStatus($"Starting listener for {lecturerName}...");
                     await firebaseService.ListenForRequests(lecturerName);
 
-                    // Start listening for audio call requests
                     Debug.WriteLine("Starting audio call request listener...");
                     await firebaseService.ListenForAudioCallRequests(lecturerName);
 
-                    // Update status to show we're listening
                     isConnected = true;
                     UpdateConnectionStatus($"Connected: Listening for requests for {lecturerName}");
                     Debug.WriteLine($"Firebase listener started for {lecturerName}");
@@ -118,7 +147,7 @@ namespace FacultyConnectApp.Forms
                     Debug.WriteLine("Failed to start Firebase listener: Lecturer name is empty");
                 }
 
-                // Update welcome label with lecturer name if available
+             
                 if (!string.IsNullOrEmpty(lecturerName))
                 {
                     lblWelcome.Text = $"Welcome back,\nProf. Walingo";
@@ -131,8 +160,8 @@ namespace FacultyConnectApp.Forms
                     "Initialization Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 UpdateConnectionStatus("Error: Failed to initialize");
             }
-            await Task.Delay(5000); // Wait 5 seconds for listeners to initialize
-            await firebaseService.TestAudioCallRequest(lecturerName);
+            
+            InitializeMessaging();
         }
 
         private void InitializeSystemTray()
@@ -142,11 +171,10 @@ namespace FacultyConnectApp.Forms
                 Debug.WriteLine("Initializing system tray icon");
 
                 notifyIcon = new NotifyIcon();
-                notifyIcon.Icon = SystemIcons.Application; // Or use your custom icon
+                notifyIcon.Icon = SystemIcons.Application; 
                 notifyIcon.Text = "Faculty Connect";
                 notifyIcon.Visible = true;
 
-                // Create context menu
                 ContextMenuStrip menu = new ContextMenuStrip();
                 menu.Items.Add("Open Dashboard", null, (s, e) => {
                     this.Show();
@@ -155,14 +183,12 @@ namespace FacultyConnectApp.Forms
                     this.Focus();
                 });
                 menu.Items.Add("Exit Application", null, (s, e) => {
-                    // This will fully exit the application
                     notifyIcon.Visible = false;
                     notifyIcon.Dispose();
                     Application.Exit();
                 });
                 notifyIcon.ContextMenuStrip = menu;
 
-                // Double-click to restore
                 notifyIcon.DoubleClick += (s, e) => {
                     this.Show();
                     this.WindowState = FormWindowState.Normal;
@@ -170,18 +196,13 @@ namespace FacultyConnectApp.Forms
                     this.Focus();
                 };
 
-                // Handle form closing event to hide instead of close
                 this.FormClosing += new FormClosingEventHandler(MainDashboard_FormClosing);
                 this.FormClosed += new FormClosedEventHandler(MainDashboard_FormClosed);
 
-                // Handle minimize button
                 this.Resize += (s, e) => {
                     if (this.WindowState == FormWindowState.Minimized)
                     {
-                        // Keep showing in taskbar for better user experience
                         this.ShowInTaskbar = true;
-
-                        // Show balloon tip
                         notifyIcon.ShowBalloonTip(3000, "Faculty Connect",
                             "Application is running in the background", ToolTipIcon.Info);
                     }
@@ -197,13 +218,11 @@ namespace FacultyConnectApp.Forms
 
         private void MainDashboard_FormClosing(object sender, FormClosingEventArgs e)
         {
-            // If user is closing the form (not application exit)
             if (e.CloseReason == CloseReason.UserClosing)
             {
-                e.Cancel = true; // Prevent the form from closing
-                this.Hide(); // Hide the form instead
+                e.Cancel = true; 
+                this.Hide(); 
 
-                // Show notification that app is still running
                 notifyIcon.ShowBalloonTip(3000, "Faculty Connect",
                     "Application is still running in the system tray. Right-click to exit.",
                     ToolTipIcon.Info);
@@ -343,10 +362,10 @@ namespace FacultyConnectApp.Forms
                 // Refresh the UI
                 CenterControls(); // Recalculate positions
 
-                lblVisitorName.Refresh();
+                lblVisitorName.Refresh(); lblTimestamp.Refresh();
                 lblStudentNumber.Refresh();
                 lblPurpose.Refresh();
-                lblTimestamp.Refresh();
+                
 
                 Debug.WriteLine("Dashboard labels updated successfully");
             }
@@ -490,12 +509,29 @@ namespace FacultyConnectApp.Forms
             }
         }
 
-        private void btnAudioCall_Click(object sender, EventArgs e)
+        private async void btnAudioCall_Click(object sender, EventArgs e)
         {
             try
             {
+                Debug.WriteLine("Audio call button clicked");
+
+                // Use the existing lecturerName field instead of txtLecturerName.Text
+                // Use the existing firebaseService field instead of _firebaseService
+
+                if (string.IsNullOrEmpty(lecturerName))
+                {
+                    MessageBox.Show("Lecturer name not available", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                    return;
+                }
+
+                // First, add the direct call method to your Firebase service
+                await firebaseService.InitiateDirectCall(lecturerName);
+
+                // Create and show the audio call window
                 var audioWindow = new AudioCallWindow();
+                audioWindow.IsAcceptedCall = true; // This tells the window it's an accepted call
                 audioWindow.Show();
+
                 Debug.WriteLine("Audio call window opened");
             }
             catch (Exception ex)
@@ -714,12 +750,347 @@ namespace FacultyConnectApp.Forms
             Process.GetCurrentProcess().Kill();
             #endif
         }
+        private void SetupMessagingLayout()
+        {
+            // Calculate the ideal position to be above the bottom buttons
+            int bottomButtonsTop = btnAudioCall.Top;
+            // Position the panel above these buttons with some margin
+            panelMessaging.Top = bottomButtonsTop - panelMessaging.Height - 20;
+
+            // Ensure the panel is centered horizontally
+            panelMessaging.Left = (panel3.Width - panelMessaging.Width) / 2;
+            try
+            {
+                // Your existing layout code...
+
+                // Make sure txtRecentMessage and other messaging elements are visible and properly sized
+                txtRecentMessage.Visible = true;
+                txtMessageInput.Visible = true;
+                btnSendMessage.Visible = true;
+                btnMessageHistory.Visible = true;
+
+                // Position elements relative to panelMessaging
+                if (panelMessaging != null)
+                {
+                    // Make sure recent message textbox has enough height
+                    txtRecentMessage.Height = panelMessaging.Height / 3;
+
+                    // Position message input and send button
+                    int inputY = txtRecentMessage.Bottom + 10;
+                    txtMessageInput.Top = inputY;
+                    btnSendMessage.Top = inputY;
+
+                    // Message history button at the bottom
+                    btnMessageHistory.Top = txtMessageInput.Bottom + 10;
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error in SetupMessagingLayout: {ex.Message}");
+            }
+        }
+
+        private void InitializeMessaging()
+        {
+            try
+            {
+                Debug.WriteLine("Initializing messaging UI...");
+
+                // Set up message input box placeholder text
+                txtMessageInput.Text = "Type your message here...";
+
+                txtMessageInput.Enter += (s, e) => {
+                    if (txtMessageInput.Text == "Type your message here...")
+                    {
+                        txtMessageInput.Text = "";
+                    }
+                };
+
+                txtMessageInput.Leave += (s, e) => {
+                    if (string.IsNullOrWhiteSpace(txtMessageInput.Text))
+                    {
+                        txtMessageInput.Text = "Type your message here...";
+                    }
+                };
+
+                // Set up button event handlers
+                btnSendMessage.Click += btnSendMessage_Click;
+                btnMessageHistory.Click += btnMessageHistory_Click;
+
+                // Make sure Enter key in the textbox sends the message
+                txtMessageInput.KeyDown += (s, e) => {
+                    if (e.KeyCode == Keys.Enter && !e.Shift)
+                    {
+                        e.SuppressKeyPress = true;
+                        btnSendMessage_Click(s, e);
+                    }
+                };
+
+                // Load initial message history
+                LoadMessageHistory();
+
+                Debug.WriteLine("Messaging UI initialized successfully");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error initializing messaging: {ex.Message}");
+            }
+        }
+
+        private async Task LoadMessageHistory()
+        {
+            try
+            {
+                Debug.WriteLine("Loading message history...");
+
+                // Clear existing history
+                messageHistory.Clear();
+
+                // Get message history from Firebase
+                if (firebaseService != null && !string.IsNullOrEmpty(lecturerName))
+                {
+                    messageHistory = await firebaseService.GetMessageHistory(lecturerName);
+
+                    // Display the most recent message if available
+                    if (messageHistory.Count > 0)
+                    {
+                        DisplayRecentMessage(messageHistory[0]);
+                    }
+                    else
+                    {
+                        txtRecentMessage.Clear();
+                    }
+
+                    Debug.WriteLine($"Loaded {messageHistory.Count} messages from history");
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error loading message history: {ex.Message}");
+                txtRecentMessage.Clear();
+            }
+        }
+
+        // Method to display the most recent message
+        private void DisplayRecentMessage(ChatMessage message)
+        {
+            try
+            {
+                if (message == null)
+                {
+                    txtRecentMessage.Clear();
+                    return;
+                }
+
+                // Update the recent message textbox
+                txtRecentMessage.Text = $"{message.SenderName}: {message.Content}";
+
+                Debug.WriteLine($"Displayed recent message: {message.Content}");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error displaying message: {ex.Message}");
+                txtRecentMessage.Clear();
+            }
+        }
+
+
 
         private void MainDashboard_Load_1(object sender, EventArgs e)
         {
 
         }
 
-        
+        private void panelMessaging_Paint(object sender, PaintEventArgs e)
+        {
+
+        }
+
+        private void lblMessagingTitle_Click(object sender, EventArgs e)
+        {
+
+        }
+
+        private void btnMessageHistory_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                Debug.WriteLine("Displaying message history...");
+
+                // Create a string to display message history
+                if (messageHistory.Count == 0)
+                {
+                    MessageBox.Show("No message history available.", "Message History", MessageBoxButtons.OK, MessageBoxIcon.Information);
+                    return;
+                }
+
+                // Create a formatted message history
+                StringBuilder historyText = new StringBuilder("Message History:\n\n");
+
+                foreach (var message in messageHistory)
+                {
+                    // Add timestamp if available
+                    string timestamp = !string.IsNullOrEmpty(message.Timestamp) ?
+                        $" ({message.Timestamp})" : "";
+
+                    historyText.AppendLine($"{message.SenderName}{timestamp}: {message.Content}");
+                    historyText.AppendLine(); // Extra line for readability
+                }
+
+                // Show message box with history
+                MessageBox.Show(historyText.ToString(), "Message History", MessageBoxButtons.OK, MessageBoxIcon.Information);
+
+                Debug.WriteLine("Message history displayed successfully");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error showing message history: {ex.Message}");
+                MessageBox.Show($"Failed to display message history: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+            }
+        }
+
+        private async void btnSendMessage_Click(object sender, EventArgs e)
+        {
+            try
+            {
+                string messageText = txtMessageInput.Text;
+
+                // Don't send empty messages or placeholder text
+                if (string.IsNullOrWhiteSpace(messageText) || messageText == "Type your message here...")
+                {
+                    return;
+                }
+
+                Debug.WriteLine($"Sending message: {messageText}");
+
+                // Disable button while sending
+                btnSendMessage.Enabled = false;
+
+                // Send the message
+                if (firebaseService != null && !string.IsNullOrEmpty(lecturerName))
+                {
+                    var message = await firebaseService.SendMessageToReceptionist(lecturerName, messageText);
+
+                    // Clear the input box
+                    txtMessageInput.Text = "Type your message here...";
+
+                    // Display the sent message in the recent message textbox
+                    DisplayRecentMessage(message);
+
+                    // Add to local history
+                    messageHistory.Insert(0, message);
+
+                    // Keep only MAX_HISTORY messages locally
+                    if (messageHistory.Count > MAX_HISTORY)
+                    {
+                        messageHistory.RemoveAt(messageHistory.Count - 1);
+                    }
+
+                    // Maintain Firebase message history limit
+                    await firebaseService.MaintainMessageHistoryLimit(lecturerName, MAX_HISTORY);
+                }
+                else
+                {
+                    MessageBox.Show("Cannot send message: Firebase service or lecturer name not initialized.",
+                        "Message Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                }
+
+                // Re-enable button
+                btnSendMessage.Enabled = true;
+
+                Debug.WriteLine("Message sent and displayed successfully");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error sending message: {ex.Message}");
+                MessageBox.Show($"Failed to send message: {ex.Message}", "Message Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
+                btnSendMessage.Enabled = true;
+            }
+        }
+
+        // Add this to your MainDashboard.cs
+        public void TestAudioCallForm()
+        {
+            try
+            {
+                Debug.WriteLine("Testing audio call form directly");
+                var form = new AudioCallRequestForm("Direct Test Caller");
+                form.ShowDialog();
+                Debug.WriteLine("Audio call form displayed successfully");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error showing form: {ex.Message}");
+            }
+        }
+
+        // Add these fields at the class level
+        private AudioCallRequestForm _currentCallForm = null;
+        private object _callFormLock = new object();
+        private bool _isProcessingAudioCall = false;
+
+        // Add this method to your MainDashboard class
+        public void ShowAudioCallRequestForm(string callerName, string lecturerName)
+        {
+            // Ensure we're on the UI thread
+            if (InvokeRequired)
+            {
+                Invoke(new Action(() => ShowAudioCallRequestForm(callerName, lecturerName)));
+                return;
+            }
+
+            lock (_callFormLock)
+            {
+                // Prevent duplicate processing
+                if (_isProcessingAudioCall)
+                {
+                    Debug.WriteLine("Already processing an audio call. Ignoring duplicate.");
+                    return;
+                }
+
+                _isProcessingAudioCall = true;
+
+                try
+                {
+                    // If there's already a form open, close it first
+                    if (_currentCallForm != null && !_currentCallForm.IsDisposed)
+                    {
+                        try
+                        {
+                            _currentCallForm.Close();
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"Error closing existing call form: {ex.Message}");
+                        }
+                        _currentCallForm = null;
+                    }
+
+                    // Create and show the new call form
+                    Debug.WriteLine($"Creating audio call form for {callerName}");
+                    _currentCallForm = new AudioCallRequestForm(callerName);
+
+                    // Show as dialog and handle the result
+                    DialogResult result = _currentCallForm.ShowDialog(this);
+                    Debug.WriteLine($"Audio call form result: {result}");
+
+                    // Forward the result to Firebase Service
+                    firebaseService.ProcessCallRequestResponse(result, lecturerName).ConfigureAwait(false);
+
+                    // Clear the reference
+                    _currentCallForm = null;
+                }
+                finally
+                {
+                    // Always reset the processing flag when done
+                    _isProcessingAudioCall = false;
+                }
+            }
+        }
+
+        private void txtRecentMessage_TextChanged(object sender, EventArgs e)
+        {
+
+        }
     }
 }

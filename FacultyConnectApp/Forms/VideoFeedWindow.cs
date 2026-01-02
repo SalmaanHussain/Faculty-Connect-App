@@ -148,7 +148,7 @@ namespace FacultyConnectApp.Forms
         private NetworkStream stream;
         private bool isConnected = false;
         private bool isRunning = false;
-        private string serverIp = "192.168.137.66"; // 📍 Pi IP here
+        private string serverIp = "192.168.137.230"; // 📍 Pi IP here
         private int serverPort = 8485;             // 📍 Port Pi uses
 
         private void pictureBox2_Click(object sender, EventArgs e)

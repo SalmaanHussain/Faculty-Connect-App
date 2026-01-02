@@ -10,11 +10,15 @@ using Newtonsoft.Json;
 using System.Diagnostics;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Threading;
+using System.Linq;
+using FacultyConnectApp.Models;
 
 namespace FacultyConnectApp.Services
 {
     public class FirebaseService
     {
+        private string lastProcessedRequestId = string.Empty;
         private string responseStatus;
         private MainDashboard _dashboard;
         private FirebaseClient firebaseClient;
@@ -22,6 +26,13 @@ namespace FacultyConnectApp.Services
         private IDisposable audioCallSubscription;
         private bool isListening = false;
         private NotifyIcon _notifyIcon;
+        private bool _isProcessingCallRequest = false;
+        private string _lastProcessedCallId = null;
+        private DateTime _lastProcessedTime = DateTime.MinValue;
+        private const int MAX_HISTORY = 5;
+        private string _lastMessageContent = "";
+        private DateTime _lastMessageTime = DateTime.MinValue;
+        private readonly TimeSpan _messageDuplicationThreshold = TimeSpan.FromSeconds(2);
 
         // Base URL - ensure this matches your Firebase database
         private readonly string dbUrl = "https://facultyconnectav-default-rtdb.asia-southeast1.firebasedatabase.app/";
@@ -447,6 +458,31 @@ namespace FacultyConnectApp.Services
 
                 Debug.WriteLine("✅ Updated availability status");
 
+                if (availabilityStatus == "false")
+                {
+                    // Create a message when lecturer is unavailable
+                    string unavailableMessage = "I'm not available at the moment. Please check back later.";
+
+                    // Create a message object for consistency (same structure as regular messages)
+                    var message = new ChatMessage(unavailableMessage, lecturerName);
+
+                    // Update latest_message node
+                    await firebaseClient
+                        .Child("lecturers")
+                        .Child(lecturerName)
+                        .Child("latest_message")
+                        .PutAsync(message);
+
+                    // Update rejection_message node - use string value
+                    await firebaseClient
+                        .Child("lecturers")
+                        .Child(lecturerName)
+                        .Child("rejection_message")
+                        .PutAsync<string>(unavailableMessage);
+
+                    Debug.WriteLine("✅ Updated unavailable message");
+                }
+
                 // Update last response time
                 await firebaseClient
                     .Child("lecturers")
@@ -720,63 +756,231 @@ namespace FacultyConnectApp.Services
             }
         }
 
-        // Add these methods to your FirebaseService class
+        private string GenerateRequestId(object requestData)
+        {
+            try
+            {
+                // Create a unique ID based on the data
+                var json = JsonConvert.SerializeObject(requestData);
+                return json.GetHashCode().ToString();
+            }
+            catch
+            {
+                // Fallback to timestamp if serialization fails
+                return DateTime.Now.Ticks.ToString();
+            }
+        }
 
-        // Add these methods to your FirebaseService class
+        private bool CheckIfRequestIsPending(object requestData)
+        {
+            try
+            {
+                if (requestData is Dictionary<string, object> dict)
+                {
+                    foreach (var key in dict.Keys)
+                    {
+                        if (string.Equals(key, "status", StringComparison.OrdinalIgnoreCase))
+                        {
+                            return string.Equals(dict[key]?.ToString(), "pending",
+                                StringComparison.OrdinalIgnoreCase);
+                        }
+                    }
+                }
 
-        // In FirebaseService.cs
+                // Try parsing from JSON
+                var json = JsonConvert.SerializeObject(requestData);
+                var data = JsonConvert.DeserializeObject<Dictionary<string, object>>(json);
+
+                if (data != null)
+                {
+                    foreach (var key in data.Keys)
+                    {
+                        if (string.Equals(key, "status", StringComparison.OrdinalIgnoreCase))
+                        {
+                            return string.Equals(data[key]?.ToString(), "pending",
+                                StringComparison.OrdinalIgnoreCase);
+                        }
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error checking if request is pending: {ex.Message}");
+            }
+
+            return false;
+        }
+
+        // Add these methods to your FirebaseService class:
+
         public async Task ListenForAudioCallRequests(string lecturerName)
         {
             try
             {
-                Debug.WriteLine("=============================");
-                Debug.WriteLine("Starting to listen for audio call requests...");
-                Debug.WriteLine($"Path: lecturers/{lecturerName}/audio_call_request");
-                Debug.WriteLine("=============================");
+                Debug.WriteLine("Starting audio call request listener...");
+                Debug.WriteLine($"Monitoring path: lecturers/{lecturerName}/audio_call_request");
 
-                // Create a separate subscription specifically for audio calls
+                // Clean up any existing audio call subscription
+                if (audioCallSubscription != null)
+                {
+                    audioCallSubscription.Dispose();
+                    audioCallSubscription = null;
+                    Debug.WriteLine("Disposed existing audio call subscription");
+                }
+
+                // Subscribe to the parent node and listen for child events
+                Debug.WriteLine("Setting up optimized subscription for audio call requests");
                 audioCallSubscription = firebaseClient
                     .Child("lecturers")
                     .Child(lecturerName)
-                    .AsObservable<object>()  // Subscribe to the entire lecturer node
-                    .Where(data => data.Key == "audio_call_request")  // Filter for audio_call_request events
+                    .Child("audio_call_request")
+                    .AsObservable<object>()
                     .Subscribe(
-                        data =>
+                        async data =>
                         {
-                            Debug.WriteLine("✅ AUDIO CALL EVENT RECEIVED: " + JsonConvert.SerializeObject(data.Object));
-                            if (data.Object != null)
+                            Debug.WriteLine($"⚡ Audio call request event detected for key: {data.Key}");
+
+                            // Deduplication check - prevent multiple processing
+                            if (_isProcessingCallRequest)
                             {
-                                ProcessAudioCallRequest(data.Object, lecturerName);
+                                Debug.WriteLine("Already processing a call request. Ignoring duplicate event.");
+                                return;
+                            }
+
+                            // IMPORTANT: We need to get the complete audio_call_request object
+                            // instead of processing the individual property updates
+                            try
+                            {
+                                // Fetch the complete audio_call_request data
+                                var completeData = await firebaseClient
+                                    .Child("lecturers")
+                                    .Child(lecturerName)
+                                    .Child("audio_call_request")
+                                    .OnceSingleAsync<Dictionary<string, object>>();
+
+                                if (completeData != null && completeData.Count > 0)
+                                {
+                                    Debug.WriteLine($"Got complete audio call data with {completeData.Count} properties");
+
+                                    // Check if status is pending
+                                    if (completeData.ContainsKey("status") &&
+                                        completeData["status"].ToString().ToLower() == "pending" &&
+                                        completeData.ContainsKey("caller_name"))
+                                    {
+                                        // Generate a unique ID for this call
+                                        string callerName = completeData["caller_name"].ToString();
+                                        string timestamp = completeData.ContainsKey("timestamp") ?
+                                                        completeData["timestamp"].ToString() :
+                                                        DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss");
+                                        string callId = $"{callerName}_{timestamp}";
+
+                                        // Skip if we've seen this exact call recently (within 5 seconds)
+                                        if (callId == _lastProcessedCallId &&
+                                            (DateTime.Now - _lastProcessedTime).TotalSeconds < 5)
+                                        {
+                                            Debug.WriteLine($"Duplicate call detected: {callId}. Ignoring.");
+                                            return;
+                                        }
+
+                                        // Mark that we're processing this call
+                                        _isProcessingCallRequest = true;
+                                        _lastProcessedCallId = callId;
+                                        _lastProcessedTime = DateTime.Now;
+
+                                        try
+                                        {
+                                            // Only process if we have both a pending status and a caller name
+                                            Debug.WriteLine("Found pending call with caller name, processing...");
+                                            ProcessCompleteAudioCallRequest(completeData, lecturerName);
+                                        }
+                                        finally
+                                        {
+                                            // Reset flag after a delay to prevent immediate reprocessing
+                                            await Task.Delay(1000);
+                                            _isProcessingCallRequest = false;
+                                        }
+                                    }
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                Debug.WriteLine($"Error fetching complete audio call data: {ex.Message}");
+                                _isProcessingCallRequest = false; // Reset flag on error
                             }
                         },
                         ex =>
                         {
-                            Debug.WriteLine($"❌ AUDIO CALL SUBSCRIPTION ERROR: {ex.Message}");
+                            Debug.WriteLine($"Audio call subscription error: {ex.Message}");
+                            _isProcessingCallRequest = false; // Reset flag on error
+
+                            // Try to restart the subscription after a delay
+                            Task.Delay(2000).ContinueWith(_ =>
+                            {
+                                if (isListening)
+                                {
+                                    ListenForAudioCallRequests(lecturerName).ConfigureAwait(false);
+                                }
+                            });
                         });
 
-                // Also check for existing audio call requests
-                var existingData = await firebaseClient
-                    .Child("lecturers")
-                    .Child(lecturerName)
-                    .Child("audio_call_request")
-                    .OnceSingleAsync<Dictionary<string, object>>();
-
-                Debug.WriteLine($"Initial audio_call_request data: {JsonConvert.SerializeObject(existingData)}");
-
-                // Process existing request if it has pending status
-                if (existingData != null &&
-                    existingData.ContainsKey("status") &&
-                    existingData["status"].ToString() == "pending")
-                {
-                    Debug.WriteLine("Found existing pending call request - processing immediately");
-                    ProcessAudioCallRequest(existingData, lecturerName);
-                }
-
-                Debug.WriteLine("Audio call request listener successfully established");
+                Debug.WriteLine("Audio call request listener optimized and started successfully");
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"❌ FAILED TO SET UP AUDIO CALL LISTENER: {ex.Message}");
+                Debug.WriteLine($"ERROR starting audio call listener: {ex.Message}");
+                _isProcessingCallRequest = false; // Reset flag on error
+            }
+        }
+        private void ProcessCompleteAudioCallRequest(Dictionary<string, object> callDict, string lecturerName)
+        {
+            try
+            {
+                Debug.WriteLine("Processing complete audio call request");
+
+                // Get caller name
+                string callerName = callDict.ContainsKey("caller_name") ?
+                    callDict["caller_name"].ToString() : "Unknown Caller";
+
+                Debug.WriteLine($"Processing call from: {callerName}");
+
+                // Show notification
+                _notifyIcon?.ShowBalloonTip(3000, "Incoming Audio Call",
+                    $"Call from: {callerName}", ToolTipIcon.Info);
+
+                if (_dashboard != null && !_dashboard.IsDisposed && _dashboard.IsHandleCreated)
+                {
+                    // Use BeginInvoke to prevent UI thread blocking
+                    _dashboard.BeginInvoke(new Action(() =>
+                    {
+                        try
+                        {
+                            // Make app visible
+                            if (!_dashboard.Visible)
+                            {
+                                _dashboard.Show();
+                                _dashboard.WindowState = FormWindowState.Normal;
+                                _dashboard.BringToFront();
+                            }
+
+                            // Let the dashboard handle showing the form
+                            // This centralizes form management in one place
+                            _dashboard.ShowAudioCallRequestForm(callerName, lecturerName);
+                        }
+                        catch (Exception ex)
+                        {
+                            Debug.WriteLine($"ERROR in UI thread: {ex.Message}");
+                        }
+                    }));
+                }
+                else
+                {
+                    // Fallback
+                    ShowStandaloneCallRequestPopup(callerName, lecturerName);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"ERROR processing complete audio call request: {ex.Message}");
             }
         }
 
@@ -784,289 +988,426 @@ namespace FacultyConnectApp.Services
         {
             try
             {
-                var existingData = await firebaseClient
+                Debug.WriteLine("Checking for existing audio call requests...");
+
+                var requestData = await firebaseClient
                     .Child("lecturers")
                     .Child(lecturerName)
                     .Child("audio_call_request")
                     .OnceSingleAsync<Dictionary<string, object>>();
 
-                Debug.WriteLine($"Initial audio_call_request data: {JsonConvert.SerializeObject(existingData)}");
+                Debug.WriteLine($"Existing audio call data: {JsonConvert.SerializeObject(requestData)}");
 
-                // If there's existing data with pending status, process it immediately
-                if (existingData != null &&
-                    existingData.ContainsKey("status") &&
-                    existingData["status"].ToString() == "pending")
+                if (requestData != null && requestData.Count > 0)
                 {
-                    Debug.WriteLine("Found existing pending call request - processing it immediately");
-                    ProcessAudioCallRequest(existingData, lecturerName);
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error checking existing audio call request: {ex.Message}");
-            }
-        }
-
-        private async Task CheckForNewAudioCallRequest(string lecturerName)
-        {
-            try
-            {
-                var data = await firebaseClient
-                    .Child("lecturers")
-                    .Child(lecturerName)
-                    .Child("audio_call_request")
-                    .OnceSingleAsync<Dictionary<string, object>>();
-
-                if (data != null &&
-                    data.ContainsKey("status") &&
-                    data["status"].ToString() == "pending")
-                {
-                    Debug.WriteLine("Found pending call request during periodic check");
-                    ProcessAudioCallRequest(data, lecturerName);
-                }
-            }
-            catch (Exception ex)
-            {
-                Debug.WriteLine($"Error in periodic audio call check: {ex.Message}");
-            }
-        }
-        private void ProcessAudioCallRequest(object requestData, string lecturerName)
-        {
-            try
-            {
-                Debug.WriteLine("Processing audio call request data: " + JsonConvert.SerializeObject(requestData));
-
-                var callData = requestData as Dictionary<string, object>;
-                if (callData == null)
-                {
-                    Debug.WriteLine("Call data is null or not a Dictionary");
-                    return;
-                }
-
-                Debug.WriteLine("Call data keys: " + string.Join(", ", callData.Keys));
-
-                // Check for status in a case-insensitive way
-                string status = "";
-                foreach (var key in callData.Keys)
-                {
-                    if (string.Equals(key, "status", StringComparison.OrdinalIgnoreCase))
+                    // Check if status is pending
+                    bool isPending = false;
+                    if (requestData.ContainsKey("status"))
                     {
-                        status = callData[key]?.ToString() ?? "";
-                        break;
-                    }
-                }
-
-                Debug.WriteLine("Call status: " + status);
-
-                // Check if status is pending in a case-insensitive way
-                if (string.Equals(status, "pending", StringComparison.OrdinalIgnoreCase))
-                {
-                    Debug.WriteLine("Call status is pending, showing popup");
-
-                    // Get caller name
-                    string callerName = "Unknown Caller";
-                    foreach (var key in callData.Keys)
-                    {
-                        if (string.Equals(key, "caller_name", StringComparison.OrdinalIgnoreCase))
-                        {
-                            callerName = callData[key]?.ToString() ?? "Unknown Caller";
-                            break;
-                        }
+                        isPending = requestData["status"].ToString() == "pending";
                     }
 
-                    // Show notification and popup on UI thread
-                    if (_dashboard != null && !_dashboard.IsDisposed && _dashboard.IsHandleCreated)
+                    if (isPending)
                     {
-                        // Use Invoke instead of BeginInvoke to ensure synchronous execution
-                        _dashboard.Invoke(new Action(() =>
-                        {
-                            try
-                            {
-                                // Make sure form is visible
-                                if (!_dashboard.Visible)
-                                {
-                                    _dashboard.Show();
-                                    _dashboard.WindowState = FormWindowState.Normal;
-                                }
-
-                                // Show notification in system tray
-                                if (_notifyIcon != null)
-                                {
-                                    _notifyIcon.ShowBalloonTip(5000, "Incoming Audio Call",
-                                        $"Call from: {callerName}", ToolTipIcon.Info);
-                                }
-
-                                Debug.WriteLine("Creating AudioCallRequestForm for caller: " + callerName);
-                                AudioCallRequestForm requestForm = new AudioCallRequestForm(callerName);
-
-                                Debug.WriteLine("Showing popup dialog");
-                                DialogResult result = requestForm.ShowDialog(_dashboard);
-
-                                Debug.WriteLine("Dialog result: " + result);
-                                ProcessCallRequestResponse(result, lecturerName).ConfigureAwait(false);
-                            }
-                            catch (Exception ex)
-                            {
-                                Debug.WriteLine($"Error showing call request dialog: {ex.Message}");
-                                MessageBox.Show($"Error: {ex.Message}", "Error", MessageBoxButtons.OK, MessageBoxIcon.Error);
-                            }
-                        }));
+                        Debug.WriteLine("Found existing pending audio call request!");
+                        ProcessAudioCallRequest(requestData, lecturerName);
                     }
                     else
                     {
-                        Debug.WriteLine("Dashboard invalid, can't show popup");
+                        Debug.WriteLine("Found audio call request but status is not pending");
                     }
                 }
                 else
                 {
-                    Debug.WriteLine("Call status is not pending, ignoring");
+                    Debug.WriteLine("No audio call requests found");
                 }
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error processing audio call request: {ex.Message}");
+                Debug.WriteLine($"Error checking existing call requests: {ex.Message}");
             }
         }
 
-
-
-        private async Task ProcessCallRequestResponse(DialogResult result, string lecturerName)
+        private void ProcessAudioCallRequest(object callData, string lecturerName)
         {
             try
             {
-                string responseStatus = result == DialogResult.Yes ? "accepted" : "rejected";
-                Debug.WriteLine($"Call {responseStatus}");
+                // Fast conversion to dictionary
+                Dictionary<string, object> callDict = null;
 
-                // If accepted, open audio call window first
-                if (result == DialogResult.Yes)
+                if (callData is Dictionary<string, object>)
                 {
-                    _dashboard.Invoke(new Action(() =>
+                    callDict = (Dictionary<string, object>)callData;
+                }
+                else if (callData is Newtonsoft.Json.Linq.JObject jObj)
+                {
+                    callDict = jObj.ToObject<Dictionary<string, object>>();
+                }
+                else
+                {
+                    // Last resort - serialize and deserialize
+                    string json = JsonConvert.SerializeObject(callData);
+                    callDict = JsonConvert.DeserializeObject<Dictionary<string, object>>(json);
+                }
+
+                if (callDict == null || !callDict.ContainsKey("status") ||
+                    callDict["status"].ToString().ToLower() != "pending")
+                {
+                    // Quick exit if not a pending call
+                    return;
+                }
+
+                // Get caller name (with fast default)
+                string callerName = callDict.ContainsKey("caller_name") ?
+                    callDict["caller_name"].ToString() : "Unknown Caller";
+
+                // Show system tray notification
+                _notifyIcon?.ShowBalloonTip(3000, "Incoming Audio Call",
+                    $"Call from: {callerName}", ToolTipIcon.Info);
+
+                // Fast path for UI update - use BeginInvoke instead of Invoke for async UI updates
+                if (_dashboard != null && !_dashboard.IsDisposed && _dashboard.IsHandleCreated)
+                {
+                    _dashboard.BeginInvoke(new Action(() =>
                     {
                         try
                         {
-                            AudioCallWindow audioWindow = new AudioCallWindow();
-                            audioWindow.Show();
-                            Debug.WriteLine("Audio call window opened successfully");
+                            // Make sure app is visible
+                            if (!_dashboard.Visible)
+                            {
+                                _dashboard.Show();
+                                _dashboard.WindowState = FormWindowState.Normal;
+                                _dashboard.BringToFront();
+                            }
+
+                            // Show the popup immediately
+                            AudioCallRequestForm requestForm = new AudioCallRequestForm(callerName);
+                            DialogResult result = requestForm.ShowDialog();
+
+                            // Process result in background
+                            Task.Run(() => ProcessCallRequestResponse(result, lecturerName));
                         }
                         catch (Exception ex)
                         {
-                            Debug.WriteLine($"Error opening audio call window: {ex.Message}");
+                            Debug.WriteLine($"ERROR in UI thread: {ex.Message}");
                         }
                     }));
                 }
+                else
+                {
+                    // Fallback to standalone popup with minimal overhead
+                    ShowStandaloneCallRequestPopup(callerName, lecturerName);
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"ERROR processing audio call request: {ex.Message}");
+            }
+        }
 
-                // Then completely remove the audio call request node
-                await firebaseClient
-                    .Child("lecturers")
-                    .Child(lecturerName)
-                    .Child("audio_call_request")
-                    .DeleteAsync();
+        private void ShowStandaloneCallRequestPopup(string callerName, string lecturerName)
+        {
+            try
+            {
+                // Create the new form
+                AudioCallRequestForm requestForm = new AudioCallRequestForm(callerName);
+                requestForm.TopMost = true;
 
-                Debug.WriteLine("✅ Removed audio call request data from Firebase");
+                DialogResult result = requestForm.ShowDialog();
+                ProcessCallRequestResponse(result, lecturerName).ConfigureAwait(false);
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error showing standalone popup: {ex.Message}");
+            }
+        }
+
+        private bool _isProcessingResponse = false;
+
+        public async Task ProcessCallRequestResponse(DialogResult result, string lecturerName)
+        {
+            try
+            {
+                Debug.WriteLine($"ProcessCallRequestResponse called with result: {result}");
+
+                // Prevent multiple calls
+                if (_isProcessingResponse)
+                {
+                    Debug.WriteLine("Already processing a response, ignoring duplicate call");
+                    return;
+                }
+
+                _isProcessingResponse = true;
+
+                try
+                {
+                    // IMPORTANT: First set the status flag before deleting
+                    string statusValue = (result == DialogResult.Yes) ? "accepted" : "rejected";
+
+                    Debug.WriteLine($"Setting call status to: {statusValue}");
+
+                    // Set the last call status flag - using anonymous object to fix serialization
+                    await firebaseClient
+                        .Child("lecturers")
+                        .Child(lecturerName)
+                        .Child("last_call_status")
+                        .PutAsync(new { value = statusValue });
+
+                    // Add timestamp to help with synchronization - also using anonymous object
+                    var timestampValue = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff");
+                    await firebaseClient
+                        .Child("lecturers")
+                        .Child(lecturerName)
+                        .Child("last_call_timestamp")
+                        .PutAsync(new { value = timestampValue });
+
+                    // Small delay to ensure status is written before deletion
+                    await Task.Delay(100);
+
+                    // Now delete the request from Firebase
+                    await firebaseClient
+                        .Child("lecturers")
+                        .Child(lecturerName)
+                        .Child("audio_call_request")
+                        .DeleteAsync();
+
+                    // Only show the AudioCallWindow if accepted
+                    if (result == DialogResult.Yes)
+                    {
+                        if (_dashboard != null && !_dashboard.IsDisposed && _dashboard.IsHandleCreated)
+                        {
+                            _dashboard.Invoke(new Action(() =>
+                            {
+                                var audioWindow = new AudioCallWindow();
+                                audioWindow.IsAcceptedCall = true;
+                                audioWindow.Show();
+                            }));
+                        }
+                    }
+                }
+                finally
+                {
+                    // Always reset the flag when done
+                    _isProcessingResponse = false;
+                }
             }
             catch (Exception ex)
             {
                 Debug.WriteLine($"Error processing call response: {ex.Message}");
-
-                // Try to update the status as a fallback if deletion fails
-                try
-                {
-                    // Update Firebase with response status
-                    await firebaseClient
-                        .Child("lecturers")
-                        .Child(lecturerName)
-                        .Child("audio_call_request")
-                        .Child("status")
-                        .PutAsync(responseStatus);
-
-                    Debug.WriteLine("✅ Updated call status as fallback");
-                }
-                catch (Exception innerEx)
-                {
-                    Debug.WriteLine($"Error in fallback status update: {innerEx.Message}");
-                }
+                _isProcessingResponse = false;
             }
         }
 
-        public async Task DiagnoseAudioCallRequest(string lecturerName)
-        {
-            try
-            {
-                // Print the exact path we're checking
-                string path = $"lecturers/{lecturerName}/audio_call_request";
-                Console.WriteLine($"Checking path: {path}");
 
-                // Try to directly read data
-                var data = await firebaseClient
-                    .Child("lecturers")
-                    .Child(lecturerName)
-                    .Child("audio_call_request")
-                    .OnceSingleAsync<Dictionary<string, object>>();
 
-                // Log what we found
-                if (data != null)
-                {
-                    Console.WriteLine("Found audio call request data:");
-                    Console.WriteLine(JsonConvert.SerializeObject(data, Formatting.Indented));
-
-                    // Try processing it directly
-                    ProcessAudioCallRequest(data, lecturerName);
-                }
-                else
-                {
-                    Console.WriteLine("No audio call request data found");
-
-                    // Create test data
-                    var testRequest = new Dictionary<string, object>
-                    {
-                        ["caller_name"] = "Test Caller",
-                        ["status"] = "pending",
-                        ["timestamp"] = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
-                    };
-
-                    // Try writing test data
-                    await firebaseClient
-                        .Child("lecturers")
-                        .Child(lecturerName)
-                        .Child("audio_call_request")
-                        .PutAsync(testRequest);
-
-                    Console.WriteLine("Created test audio call request data");
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine($"Diagnosis error: {ex.Message}");
-            }
-        }
-
-        // In FirebaseService.cs
         public async Task TestAudioCallRequest(string lecturerName)
         {
             try
             {
-                Debug.WriteLine("Testing audio call request directly...");
+                Debug.WriteLine("Testing audio call request...");
 
-                // Create test data
-                var testRequest = new Dictionary<string, object>
+                // Create test request data - use structure matching what your visitor app sends
+                var requestData = new Dictionary<string, object>
                 {
-                    ["caller_name"] = "Direct Test Caller",
+                    ["caller_name"] = "Test Caller",
                     ["status"] = "pending",
                     ["timestamp"] = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")
                 };
 
-                // Send to Firebase
+                // Send it to Firebase
                 await firebaseClient
                     .Child("lecturers")
                     .Child(lecturerName)
                     .Child("audio_call_request")
-                    .PutAsync(testRequest);
+                    .PutAsync(requestData);
 
-                Debug.WriteLine("Test audio call request sent!");
+                Debug.WriteLine("Test audio call request sent successfully");
             }
             catch (Exception ex)
             {
-                Debug.WriteLine($"Error testing audio call: {ex.Message}");
+                Debug.WriteLine($"Error sending test audio call request: {ex.Message}");
+            }
+        }
+
+        // Add this method to your FirebaseService.cs class
+        public async Task InitiateDirectCall(string lecturerName)
+        {
+            Debug.WriteLine($"Initiating direct call for {lecturerName}");
+
+            try
+            {
+                // Create data for direct call
+                var directCallData = new Dictionary<string, object>
+                {
+                    ["initiated_by"] = lecturerName,
+                    ["status"] = "direct_call",
+                    ["timestamp"] = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss.fff")
+                };
+
+                // Write to Firebase - using proper serialization pattern
+                await firebaseClient
+                    .Child("lecturers")
+                    .Child(lecturerName)
+                    .Child("direct_call_flag")
+                    .PutAsync(directCallData);
+
+                Debug.WriteLine("Direct call flag set in Firebase");
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error initiating direct call: {ex.Message}");
+                throw; // Rethrow so the caller can handle it
+            }
+        }
+
+        public async Task<ChatMessage> SendMessageToReceptionist(string lecturerName, string messageContent)
+        {
+            try
+            {
+                Debug.WriteLine($"Sending message to receptionist: {messageContent}");
+
+                // Create a new message object with guaranteed unique ID
+                var message = new ChatMessage(messageContent, lecturerName);
+
+                // Use a transaction to ensure atomicity
+                await firebaseClient
+                    .Child("lecturers")
+                    .Child(lecturerName)
+                    .Child("messages")
+                    .Child(message.MessageId)
+                    .PutAsync(message);
+
+                // Save to latest_message separately
+                await firebaseClient
+                    .Child("lecturers")
+                    .Child(lecturerName)
+                    .Child("latest_message")
+                    .PutAsync(message);
+
+                // Update last_response timestamp with JSON object
+                await firebaseClient
+                    .Child("lecturers")
+                    .Child(lecturerName)
+                    .Child("last_response")
+                    .PutAsync(new { value = DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") });
+
+                Debug.WriteLine($"✅ Message sent with ID: {message.MessageId}");
+                return message;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"❌ Error sending message: {ex.Message}");
+                throw;
+            }
+        }
+
+
+        // Retrieve message history for a lecturer
+        public async Task<List<ChatMessage>> GetMessageHistory(string lecturerName)
+        {
+            try
+            {
+                Debug.WriteLine($"Retrieving message history for {lecturerName}");
+
+                // Check if messages node exists
+                var messagesExist = await firebaseClient
+                    .Child("lecturers")
+                    .Child(lecturerName)
+                    .Child("messages")
+                    .OnceSingleAsync<object>();
+
+                if (messagesExist == null)
+                {
+                    Debug.WriteLine("No message history found");
+                    return new List<ChatMessage>();
+                }
+
+                // Fetch messages from Firebase
+                var messagesData = await firebaseClient
+                    .Child("lecturers")
+                    .Child(lecturerName)
+                    .Child("messages")
+                    .OrderByKey()
+                    .LimitToLast(MAX_HISTORY)
+                    .OnceAsync<ChatMessage>();
+
+                // FIXED: Create a Dictionary to track unique MessageIds
+                Dictionary<string, ChatMessage> uniqueMessages = new Dictionary<string, ChatMessage>();
+
+                // Process each message, ensuring no duplicates
+                foreach (var item in messagesData)
+                {
+                    if (item.Object != null && !string.IsNullOrEmpty(item.Object.MessageId))
+                    {
+                        // Only add if not already in the dictionary
+                        if (!uniqueMessages.ContainsKey(item.Object.MessageId))
+                        {
+                            uniqueMessages[item.Object.MessageId] = item.Object;
+                        }
+                    }
+                }
+
+                // Convert to a list and sort
+                var messages = uniqueMessages.Values
+                    .OrderByDescending(m => m.Timestamp)
+                    .ToList();
+
+                Debug.WriteLine($"Retrieved {messages.Count} unique messages");
+                return messages;
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"❌ Error retrieving messages: {ex.Message}");
+                return new List<ChatMessage>(); // Return empty list on error
+            }
+        }
+
+        public async Task MaintainMessageHistoryLimit(string lecturerName, int limit = 5)
+        {
+            try
+            {
+                // Get all messages
+                var messagesData = await firebaseClient
+                    .Child("lecturers")
+                    .Child(lecturerName)
+                    .Child("messages")
+                    .OrderByKey()
+                    .OnceAsync<ChatMessage>();
+
+                var messages = messagesData.ToList();
+
+                // If we have more than the limit, delete the oldest ones
+                if (messages.Count > limit)
+                {
+                    Debug.WriteLine($"Found {messages.Count} messages, removing oldest to maintain limit of {limit}");
+
+                    // Sort by timestamp (oldest first)
+                    var orderedMessages = messages
+                        .OrderBy(m => m.Object.Timestamp)
+                        .ToList();
+
+                    // Get messages to delete (oldest messages beyond our limit)
+                    var messagesToDelete = orderedMessages
+                        .Take(orderedMessages.Count - limit)
+                        .ToList();
+
+                    // Delete each old message
+                    foreach (var message in messagesToDelete)
+                    {
+                        await firebaseClient
+                            .Child("lecturers")
+                            .Child(lecturerName)
+                            .Child("messages")
+                            .Child(message.Key)
+                            .DeleteAsync();
+
+                        Debug.WriteLine($"Deleted old message: {message.Key}");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Debug.WriteLine($"Error maintaining message history: {ex.Message}");
             }
         }
     }
